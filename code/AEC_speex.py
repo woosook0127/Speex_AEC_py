@@ -1,5 +1,7 @@
 import numpy as np
 import soundfile as sf
+import pickle
+import os
 
 import matplotlib.pyplot as plt
 
@@ -44,9 +46,15 @@ def windowed_calculate_erle(input, estimated_echo, tag:str='real', window_size=1
     return np.array(erle_arr)
 
 # ref, mic must be 1-d arr
-def run_AEC(ref, mic, fs, processor, frame_size=128, filter_length=1024, output_filename=None):
+def run_AEC(ref, mic, fs, processor, frame_size=128, filter_length=1024, 
+            output_filename=None, filter_path=None):
     default_path = '../data/Output/'
     processor = processor(fs, frame_size, filter_length)
+    
+    # Load pre-trained filter if provided
+    if filter_path is not None and os.path.exists(filter_path):
+        processor.load_filter(filter_path)
+    
     aec_speech, aec_echo = processor.main_loop(ref, mic)
 
     if output_filename is not None:
@@ -54,7 +62,7 @@ def run_AEC(ref, mic, fs, processor, frame_size=128, filter_length=1024, output_
         sf.write(default_path + "s_" + output_filename + ".wav", aec_speech, fs)
         sf.write(default_path + "n_" + output_filename + ".wav", aec_echo, fs)
         
-    return aec_speech, aec_echo
+    return aec_speech, aec_echo, processor
 
 class MDF:
     def __init__(self, fs: int, frame_size: int, filter_length: int) -> None: 
@@ -129,6 +137,13 @@ class MDF:
         self.Davg2 = 0
         self.Dvar1 = 0
         self.Dvar2 = 0
+        
+        # Convergence tracking
+        self.convergence_frame = None  # 프레임 번호 (adapted가 1이 되는 시점, 현재 실행)
+        self.saved_convergence_frame = None  # 저장된 필터의 수렴 프레임 (이전 학습 정보, 참고용)
+        self.leak_estimates = []  # leak_estimate 값들을 저장
+        self.frame_numbers = []  # 프레임 번호들
+        self.current_frame = 0  # 현재 프레임 번호
     #-----------------------------------------------------------------------    
     def filter_dc_notch16(self, mic, mem):
         out = np.zeros_like(mic)
@@ -419,8 +434,17 @@ class MDF:
             RER = self.Vey*self.Vey/(1+self.Vee*self.Vyy)
         if RER > .5:
             RER = .5
-        if (not self.adapted and self.sum_adapt > MDF_blocks and self.leak_estimate*self.Vyy > .03*self.Vyy):
+        # Track convergence: adapted가 0에서 1로 바뀌는 시점
+        was_adapted = self.adapted
+        if (not self.adapted and self.sum_adapt > MDF_blocks and self.leak_estimate*self.Vyy > .03*self.Vyy) :
             self.adapted = 1
+            if self.convergence_frame is None:
+                self.convergence_frame = self.current_frame+1
+        
+        # Log leak_estimate for plotting
+        self.leak_estimates.append(self.leak_estimate)
+        self.frame_numbers.append(self.current_frame)
+        
         return RER
     #-----------------------------------------------------------------------
     #Update the adaptation of the fself.outilter based on current RER
@@ -456,6 +480,7 @@ class MDF:
 
         self.out = np.zeros((self.frame_size, num_mic),)
         self.cancel_count +=1
+        self.current_frame += 1  # 프레임 번호 증가
         
         self.pre_emphasis(num_mic, mic)
         self.reinforce_far_end(num_spk, far_end)
@@ -501,3 +526,101 @@ class MDF:
         y = y/32768.0
         
         return e, y
+    
+    def save_filter(self, filepath):
+        """
+        Save the converged filter weights (W) and related parameters.
+        
+        Args:
+            filepath: Path to save the filter (should end with .pkl)
+        """
+        filter_state = {
+            'W': self.W,
+            'foreground': self.foreground,
+            'sampling_rate': self.sampling_rate,
+            'frame_size': self.frame_size,
+            'filter_length': self.filter_length,
+            'MDF_blocks': self.MDF_blocks,
+            'window_size': self.window_size,
+            'num_spk': self.num_spk,
+            'num_mic': self.num_mic,
+            'prop': self.prop,
+            'power': self.power,
+            'power_1': self.power_1,
+            'adapted': self.adapted,
+            'leak_estimate': self.leak_estimate,
+            'convergence_frame': self.convergence_frame,
+            'sum_adapt': self.sum_adapt,  # sum_adapt도 저장
+        }
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(filter_state, f)
+        print(f"Filter saved to {filepath}")
+        if self.convergence_frame is not None:
+            print(f"  Convergence frame: {self.convergence_frame}")
+            print(f"  Convergence time: {self.convergence_frame * self.frame_size / self.sampling_rate:.3f} seconds")
+    
+    def load_filter(self, filepath):
+        """
+        Load a previously saved filter.
+        
+        Args:
+            filepath: Path to load the filter from
+        """
+        with open(filepath, 'rb') as f:
+            filter_state = pickle.load(f)
+        
+        # Verify compatibility
+        if (filter_state['sampling_rate'] != self.sampling_rate or
+            filter_state['frame_size'] != self.frame_size or
+            filter_state['filter_length'] != self.filter_length):
+            raise ValueError(
+                f"Filter parameters mismatch. "
+                f"Saved: fs={filter_state['sampling_rate']}, "
+                f"frame_size={filter_state['frame_size']}, "
+                f"filter_length={filter_state['filter_length']}. "
+                f"Current: fs={self.sampling_rate}, "
+                f"frame_size={self.frame_size}, "
+                f"filter_length={self.filter_length}"
+            )
+        
+        # Load filter state
+        self.W = filter_state['W']
+        self.foreground = filter_state['foreground']
+        self.prop = filter_state['prop']
+        self.power = filter_state['power']
+        self.power_1 = filter_state['power_1']
+        self.leak_estimate = filter_state['leak_estimate']
+        self.sum_adapt = filter_state['sum_adapt']/2
+
+        # 이전 학습의 수렴 정보는 별도로 저장 (참고용)
+        self.saved_convergence_frame = filter_state.get('convergence_frame', None)
+        saved_adapted = filter_state.get('adapted', 0)  # 저장된 adapted 상태 (참고용)
+        saved_sum_adapt = filter_state.get('sum_adapt', 0)  # 저장된 sum_adapt (참고용)
+        
+        # 새로운 실행을 위한 변수들은 초기화
+        self.adapted = 0  # 새로운 실행에서는 0으로 초기화 (새로운 수렴 추적)
+        self.convergence_frame = None  # 새로운 실행에서는 None으로 초기화 (새로운 수렴 추적)
+        self.current_frame = 0  # 프레임 번호 초기화
+        self.leak_estimates = []  # 새로운 실행의 leak_estimate 리스트
+        self.frame_numbers = []  # 새로운 실행의 프레임 번호 리스트
+        
+        # # sum_adapt 초기화: 이미 수렴된 필터라면 더 빠른 수렴을 위해 MDF_blocks보다 큰 값으로 설정
+        # # 저장된 필터가 이미 수렴된 상태였다면, sum_adapt를 충분히 큰 값으로 설정하여 빠른 재수렴 가능
+
+        # if saved_adapted == 1:
+        #     self.sum_adapt = self.MDF_blocks + 1  # 수렴 조건(sum_adapt > MDF_blocks)을 만족하도록 설정
+        # else:
+        # self.sum_adapt = 0  # 수렴되지 않은 필터는 0부터 시작
+        
+        print(f"Filter loaded from {filepath}")
+        if self.saved_convergence_frame is not None:
+            print(f"  Saved convergence frame (from training): {self.saved_convergence_frame}")
+            print(f"  Saved convergence time: {self.saved_convergence_frame * self.frame_size / self.sampling_rate:.3f} seconds")
+            print(f"  Saved adapted state (from training): {saved_adapted}")
+        print(f"  Current adapted state: {self.adapted} (reset for new execution)")
+        print(f"  Leak estimate: {self.leak_estimate:.6f}")
+        print(f"  Note: New execution will track convergence from frame 0.")
